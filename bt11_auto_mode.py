@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import signal
+import statistics
 import struct
 import subprocess
 import sys
@@ -62,26 +63,42 @@ MODE_NAMES = {
 CAPTURE_RATE = 48000          # what we ask pw-record for, in Hz
 CAPTURE_CHANNELS = 2
 MID_BAND = (1000.0, 6000.0)   # reference band for the "is anything playing" test
-# Lossy encoders put a brick wall at the top of the band; lossless content does
-# not.  So the detector looks for a *step* between neighbouring narrow bands,
-# which is independent of absolute level -- real music rolls off by tens of dB
-# across the top octave without ever stepping.  Measured on this machine
-# (2026-09-12, see VERIFICATION.md): a lossless stream steps by at most 5 dB
-# between 2 kHz bands, while MP3 128k steps 63 dB, AAC 128k 66 dB and MP3 320k
-# 67 dB at its 20.3 kHz wall.
-CLIFF_START_KHZ = 10.0
-CLIFF_BAND_KHZ = 1.0
-CLIFF_MIN_STEP_DB = 35.0      # at or above this a step can only be a codec wall
-# ...and the band above it must be at the digital floor: a codec zeroes the
-# spectrum above its cutoff (measured -75 to -77 dB relative to the mid band),
-# while lossless content still has energy there even when it rolls off hard
-# (measured -43 dB for a live lossless stream).
-CLIFF_FLOOR_MARGIN_DB = 60.0
-# A 44.1 kHz source resampled up to 48 kHz ends abruptly at 22.05 kHz, which is
-# the source's own Nyquist and not a codec.  Steps that lie entirely inside the
-# top few percent of the band are therefore ignored; a codec wall sits lower
-# down than that and is still caught.
-CLIFF_EDGE_GUARD = 0.95
+# How lossy content is told apart from lossless content.
+#
+# A lossy encoder puts a hard wall at the top of the band; a natural, lossless
+# rolloff never does.  The trigger is therefore the largest step between
+# neighbouring 1 kHz bands, searched only below WALL_MAX_KHZ: a 44.1 kHz source
+# resampled up to 48 kHz ends at 22.05 kHz, and a resampler's transition band
+# around 20-22 kHz would otherwise look like a wall (measured: a 19 dB step for
+# a *lossless* file played through Chromium).
+#
+# Measured distributions (1 kHz bands; finer bands only smear the wall):
+#   lossless  PCM 44.1k/48k, Chromium 44.1k       step 0.3 -  2.7 dB
+#   Spotify lossless, real music, live            step 3.8 - 15   dB
+#   lossy     bilibili AAC 48k                    step 22  - 55   dB
+#   lossy     MP3 128k / AAC 128k                 step 66  / 54   dB
+# Real music closes the gap that synthetic noise suggests: the classes are only
+# about 7 dB apart (Spotify reaches ~15 dB, bilibili starts at ~22 dB).
+#
+# The two thresholds are deliberately biased towards *not* degrading lossless
+# audio, because the two mistakes do not cost the same: entering Low Latency on
+# lossless content loses quality, while staying in Lossless/High Quality on
+# lossy content only costs a little latency.
+#
+#   M_l: to *enter* Low Latency the step must reach WALL_ENTER_LL_DB   (20 dB)
+#   M_h: to *leave* Low Latency the step must fall to WALL_LEAVE_LL_DB (12 dB)
+#
+# In quality terms (how intact the top of the band is) that is M_l = -20 dB and
+# M_h = -12 dB: hysteresis, so entering needs clearly bad content, returning
+# needs clearly good content, and the 12-20 dB dead band leaves the mode alone.
+# That dead band is what stops the two modes from flapping and interrupting the
+# audio, and it also makes bilibili sticky: one clear wall puts it in Low
+# Latency and the dead band keeps it there.
+WALL_ENTER_LL_DB = 20.0
+WALL_LEAVE_LL_DB = 12.0
+WALL_START_KHZ = 8.0
+WALL_BAND_KHZ = 1.0
+WALL_MAX_KHZ = 19.0
 SILENCE_FLOOR_DBFS = -70.0    # below this the mid band counts as no content
 
 
@@ -240,46 +257,32 @@ def mid_power_db(samples, rate: float) -> float:
     return 10.0 * math.log10(_band_power(freqs, spectra, *MID_BAND) + EPS)
 
 
-def codec_cliff_db(samples, capture_rate: float,
-                   content_rate: int | None) -> tuple[float, float | None]:
-    """Largest band-to-band step that can only be a lossy encoder's wall.
+def wall_step_db(samples, capture_rate: float,
+                 content_rate: int | None) -> tuple[float, float | None]:
+    """Largest band-to-band step below WALL_MAX_KHZ, and where it sits.
 
-    Returns (drop in dB, position in kHz).  Steps are only accepted below
-    `CLIFF_EDGE_GUARD` of the content Nyquist, because the source's own rate
-    limit also looks like a wall in a resampled capture.  (0.0, None) means the
-    top of the band is continuous, i.e. nothing points at a lossy encoder.
+    Lossless content rolls off smoothly, so this stays at a few dB; a lossy
+    encoder's wall shows up as tens of dB.
     """
-
-    import math
 
     rate = content_rate or capture_rate
     limit = min(capture_rate, rate) / 2.0
-    guard = CLIFF_EDGE_GUARD * rate / 2.0
-
+    top = min(WALL_MAX_KHZ, limit - WALL_BAND_KHZ / 2.0)
     bands: list[tuple[float, float]] = []
-    low = CLIFF_START_KHZ * 1000.0
-    while low < limit - 500.0:
-        high = min(low + CLIFF_BAND_KHZ * 1000.0, limit)
-        bands.append((low, high))
-        low = high
+    low = WALL_START_KHZ * 1000.0
+    while low + WALL_BAND_KHZ * 1000.0 <= top * 1000.0 + 1.0:
+        bands.append((low, low + WALL_BAND_KHZ * 1000.0))
+        low += WALL_BAND_KHZ * 1000.0
     if len(bands) < 2:
         return 0.0, None
-
     freqs, spectra = _power_spectrum(samples, capture_rate)
-    levels = [_band_power(freqs, spectra, low, high) for low, high in bands]
-    floor = 10.0 * math.log10(_band_power(freqs, spectra, *MID_BAND) + EPS)
+    levels = [10.0 * __import__("math").log10(
+        _band_power(freqs, spectra, low, high) + EPS) for low, high in bands]
     worst, position = 0.0, None
     for index in range(len(levels) - 1):
-        if bands[index][0] >= guard:
-            continue                      # could be the source-rate edge
-        if levels[index] <= 0.0 or levels[index + 1] <= 0.0:
-            continue
-        above = 10.0 * math.log10(levels[index + 1])
-        if above > floor - CLIFF_FLOOR_MARGIN_DB:
-            continue                      # something is still there: not a wall
-        drop = 10.0 * math.log10(levels[index] / levels[index + 1])
-        if drop > worst:
-            worst, position = drop, bands[index][1] / 1000.0
+        step = levels[index] - levels[index + 1]
+        if step > worst:
+            worst, position = step, bands[index][1] / 1000.0
     return worst, position
 
 
@@ -421,25 +424,45 @@ def set_mode(mode: int) -> None:
 
 # --- decision ---------------------------------------------------------------
 
-def decide(cliff_db: float, cliff_khz: float | None, mid_dbfs: float,
-           rate: int | None,
-           min_step_db: float = CLIFF_MIN_STEP_DB) -> tuple[int | None, str]:
-    """Map a measurement to an aptX Adaptive mode."""
+def decide(step_db: float | None, mid_db: float, rate: int | None,
+           current: int | None = None,
+           enter_ll: float = WALL_ENTER_LL_DB,
+           leave_ll: float = WALL_LEAVE_LL_DB) -> tuple[int | None, str]:
+    """Map a wall-step measurement to an aptX Adaptive mode, with hysteresis.
+
+    `current` is the mode last written.  Entering Low Latency needs a step of at
+    least `enter_ll` dB; leaving it needs the step to fall to `leave_ll` dB.
+    Anything in between keeps the current mode, so borderline content cannot
+    make the two modes flap (every change costs a link re-negotiation).
+    """
 
     if rate is None:
-        return None, "no running stream with a known sample rate"
-    if mid_dbfs < SILENCE_FLOOR_DBFS:
-        return None, f"no usable content (mid {mid_dbfs:.1f} dBFS)"
-    if cliff_khz is not None and cliff_db >= min_step_db:
-        return APTX_LOW_LATENCY, (f"lossy {rate} Hz, {cliff_db:.0f} dB wall at "
-                                  f"{cliff_khz:.0f} kHz -> Low Latency")
-    detail = f"no codec wall (largest step {cliff_db:.0f} dB)"
-    if rate == 44100:
-        return APTX_LOSSLESS, f"near-lossless 44.1 kHz, {detail} -> aptX Lossless"
-    return APTX_HIGH_QUALITY, f"near-lossless {rate} Hz, {detail} -> High Quality"
+        return None, "no running stream with a known sample rate", "no-rate"
+    if mid_db < SILENCE_FLOOR_DBFS or step_db is None:
+        return None, f"no usable content (reference band {mid_db:.1f} dB)", "silent"
+    good = APTX_LOSSLESS if rate == 44100 else APTX_HIGH_QUALITY
+    if current == APTX_LOW_LATENCY:
+        if step_db <= leave_ll:
+            return good, (f"top of band recovered (step {step_db:.0f} dB <= "
+                          f"{leave_ll:.0f} dB) -> {MODE_NAMES[good]}"), "release"
+        return None, (f"staying in Low Latency: step {step_db:.0f} dB has not "
+                      f"fallen to {leave_ll:.0f} dB"), "hold-ll"
+    if step_db >= enter_ll:
+        return APTX_LOW_LATENCY, (f"lossy {rate} Hz: {step_db:.0f} dB wall -> "
+                                  f"Low Latency"), "enter-ll"
+    # On the good side the sample rate is a *fact*, not a measurement, so the
+    # Lossless/High-Quality choice tracks it on every poll.  (Tracking it only
+    # when leaving Low Latency left the dongle stuck on High Quality forever.)
+    if current != good:
+        return good, (f"near-lossless {rate} Hz, step {step_db:.0f} dB -> "
+                      f"{MODE_NAMES[good]}"), "good-mode"
+    return None, (f"holding {MODE_NAMES[good]}: step {step_db:.0f} dB is below "
+                  f"trigger (release at {leave_ll:.0f} dB)"), "hold-good"
 
 
 def content_rate(players: list[tuple[str, int | None]]) -> int | None:
+    """Sample rate of the content, taken from the playing PipeWire streams."""
+
     rate = None
     for _name, player_rate in players:
         if player_rate:
@@ -448,18 +471,20 @@ def content_rate(players: list[tuple[str, int | None]]) -> int | None:
 
 
 def measure_samples(samples: list[float], capture_rate: int, rate: int | None,
-                    min_step_db: float):
-    cliff_db, cliff_khz = codec_cliff_db(samples, capture_rate, rate)
-    mid_dbfs = mid_power_db(samples, capture_rate)
-    return (decide(cliff_db, cliff_khz, mid_dbfs, rate, min_step_db),
-            cliff_db, cliff_khz, mid_dbfs, rate)
+                    args, current: int | None = None):
+    step_db, position = wall_step_db(samples, capture_rate, rate)
+    mid_db = mid_power_db(samples, capture_rate)
+    return (decide(step_db, mid_db, rate, current,
+                   getattr(args, "enter_ll", WALL_ENTER_LL_DB),
+                   getattr(args, "leave_ll", WALL_LEAVE_LL_DB)),
+            step_db, mid_db, rate, position, current)
 
 
-def measure(sink_name: str, seconds: float, min_step_db: float,
-            players: list[tuple[str, int | None]]):
+def measure(sink_name: str, seconds: float, args, players):
     rate = content_rate(players)
     samples, capture_rate = capture_pcm(seconds, sink_name)
-    return measure_samples(samples, capture_rate, rate, min_step_db)
+    result = measure_samples(samples, capture_rate, rate, args, current_mode())
+    return result[:4]
 
 
 # --- commands ---------------------------------------------------------------
@@ -475,12 +500,12 @@ def command_once(args) -> int:
     if not players:
         log("nothing is playing into the BT11")
         return 0
-    (mode, reason), cliff_db, cliff_khz, mid_dbfs, rate = measure(
-        sink_name, args.seconds, args.min_step, players
-    )
-    where = "none" if cliff_khz is None else f"{cliff_khz:.0f} kHz"
-    log(f"players={players} largest band step={cliff_db:.0f} dB at {where} "
-        f"mid={mid_dbfs:.1f} dBFS -> {reason}")
+    (mode, reason, _label), step_db, mid_db, rate, position = measure(
+        sink_name, args.seconds, args, players)
+    shown = "n/a" if step_db is None else f"{step_db:.1f}"
+    where = "n/a" if position is None else f"{position:.0f} kHz"
+    log(f"players={players} step={shown} dB at {where} ref={mid_db:.1f} dB "
+        f"-> {reason}")
     if mode is None:
         return 0
     was = current_mode()
@@ -497,19 +522,19 @@ def command_run(args) -> int:
         log("BT11 is not plugged in; exiting so the path unit can re-arm")
         return 0
     log(f"watching the BT11 (window {args.seconds}s, poll {args.interval}s, "
-        f"wall threshold {args.min_step} dB, apply={not args.dry_run})")
+        f"enter LL at {args.enter_ll} dB step, leave LL at "
+        f"{args.leave_ll} dB step, "
+        f"confirm {args.confirm}s, apply={not args.dry_run})")
 
-    history: collections.deque = collections.deque(maxlen=args.debounce)
-    last_applied: int | None = None
+    last_written: int | None = None
     last_message: str | None = None
-    monitor: SinkMonitor | None = None
-    sink_name: str | None = None
-    # Switching streams (or a gap between them) leaves a mixed window; waiting
-    # one window after the set of playing streams changes keeps those
-    # transitions from flipping the mode back and forth.
+    candidate: int | None = None
+    candidate_since = 0.0
     settle_until = 0.0
     last_players: tuple | None = None
     next_allowed = 0.0
+    monitor: SinkMonitor | None = None
+    sink_name: str | None = None
 
     def drop_monitor() -> None:
         nonlocal monitor, sink_name
@@ -543,42 +568,51 @@ def command_run(args) -> int:
                     last_message = "monitoring"
             players = active_playback(document, sink_id)
             key = tuple(sorted(players))
+            now = time.monotonic()
             if key != last_players:
+                # A new set of streams leaves a window that mixes old and new
+                # audio; start clean and wait one window before deciding.
                 last_players = key
-                history.clear()
-                settle_until = time.monotonic() + args.seconds
+                candidate, candidate_since = None, 0.0
+                settle_until = now + args.seconds
             if not players or not monitor.full():
-                history.clear()
+                candidate, candidate_since = None, 0.0
                 if last_message != "idle":
                     log("idle: nothing playing into the BT11")
                     last_message = "idle"
                 time.sleep(args.interval)
                 continue
-            (mode, reason), _cliff_db, _cliff_khz, _mid, _rate = measure_samples(
-                monitor.mono_samples(), CAPTURE_RATE, content_rate(players),
-                args.min_step
-            )
-            if reason != last_message:       # one line per state, not per poll
+
+            samples = monitor.mono_samples()
+            rate = content_rate(players)
+            step_db, _position = wall_step_db(samples, CAPTURE_RATE, rate)
+            mode, reason, label = decide(step_db,
+                                         mid_power_db(samples, CAPTURE_RATE),
+                                         rate, last_written, args.enter_ll,
+                                         args.leave_ll)
+            key = f"{label}:{mode}"
+            if key != last_message:          # one line per state, not per poll
                 log(reason)
-                last_message = reason
-            if mode is None or time.monotonic() < settle_until:
-                history.clear()
+                last_message = key
+            if mode is None or now < settle_until:
+                candidate, candidate_since = None, 0.0
                 time.sleep(args.interval)
                 continue
-            history.append(mode)
-            if len(history) < args.debounce or len(set(history)) != 1:
+            if mode != candidate:
+                candidate, candidate_since = mode, now
+            if now - candidate_since < args.confirm:
                 time.sleep(args.interval)
                 continue
-            if (not args.dry_run and last_applied != mode
-                    and time.monotonic() >= next_allowed):
+            if (not args.dry_run and last_written != mode
+                    and now >= next_allowed):
                 was = current_mode()
                 if was != mode:
                     set_mode(mode)
                     log(f"mode {was} -> {mode} ({MODE_NAMES[mode]})")
                 else:
                     log(f"mode already {mode} ({MODE_NAMES[mode]})")
-                last_applied = mode
-                next_allowed = time.monotonic() + args.cooldown
+                last_written = mode
+                next_allowed = now + args.cooldown
             time.sleep(args.interval)
     finally:
         drop_monitor()
@@ -604,17 +638,19 @@ def command_analyse(args) -> int:
         raise SystemExit(f"unsupported sample width {width}")
     left = samples[0::channels]
     content = args.content_rate or rate
-    cliff_db, cliff_khz = codec_cliff_db(left, rate, content)
-    mid_dbfs = mid_power_db(left, rate)
-    print(f"{args.file}: rate={rate} content={content} mid={mid_dbfs:.1f} dB "
-          f"largest step={cliff_db:.0f} dB"
-          f"{'' if cliff_khz is None else f' at {cliff_khz:.0f} kHz'} "
-          f"verdict={'near-lossless' if (cliff_khz is None or cliff_db < args.min_step) else 'lossy'}")
+    step_db, position = wall_step_db(left, rate, content)
+    mid = mid_power_db(left, rate)
+    _mode, reason, _label = decide(step_db, mid, content, None,
+                                   args.enter_ll, args.leave_ll)
+    shown = "n/a" if step_db is None else f"{step_db:.1f}"
+    where = "n/a" if position is None else f"{position:.0f} kHz"
+    print(f"{args.file}: rate={rate} content={content} ref={mid:.1f} dB "
+          f"step={shown} dB at {where} -> {reason}")
     return 0
 
 
 def command_self_test(_args) -> int:
-    """Check the decision table and the wall detector end to end."""
+    """Check the decision table (including hysteresis) and the metric."""
 
     import random
 
@@ -626,28 +662,40 @@ def command_self_test(_args) -> int:
         failures += 1 if not ok else 0
         print(f"  {'ok  ' if ok else 'FAIL'} {name}: got {got!r}, want {want!r}")
 
-    # decision table: (largest step dB, position kHz, mid dBFS, rate)
-    check("no wall, 44.1 kHz", decide(5.0, None, -25.0, 44100)[0], APTX_LOSSLESS)
-    check("no wall, 48 kHz", decide(4.0, None, -25.0, 48000)[0], APTX_HIGH_QUALITY)
-    check("no wall, 96 kHz", decide(5.0, None, -25.0, 96000)[0], APTX_HIGH_QUALITY)
-    check("wall at 18 kHz", decide(63.0, 18.0, -25.0, 44100)[0], APTX_LOW_LATENCY)
-    check("wall at 20 kHz (320k)", decide(67.0, 20.0, -25.0, 44100)[0],
-          APTX_LOW_LATENCY)
-    check("musical rolloff is not a wall", decide(12.0, 20.0, -25.0, 44100)[0],
-          APTX_LOSSLESS)
-    check("silence decides nothing", decide(0.0, None, -80.0, 44100)[0], None)
-    check("unknown rate decides nothing", decide(0.0, None, -25.0, None)[0], None)
+    LL, HQ, LS = APTX_LOW_LATENCY, APTX_HIGH_QUALITY, APTX_LOSSLESS
+    enter, leave = WALL_ENTER_LL_DB, WALL_LEAVE_LL_DB
+    dead = (enter + leave) / 2.0
 
-    # Detector end to end.  A codec wall is a spectrum that simply stops, so
-    # the test signal is built from tones below 15 kHz only; a gradual filter
-    # rolloff would not be a fair model of one.
+    # from a good mode: only a clear wall triggers Low Latency
+    check("lossless 44.1k, no wall", decide(0.0, -25.0, 44100, LS)[0], None)
+    check("lossless 48k, no wall", decide(4.0, -25.0, 48000, HQ)[0], None)
+    check("spotify worst case, no wall", decide(15.0, -25.0, 44100, LS)[0], None)
+    check("bilibili wall from good mode", decide(22.0, -25.0, 48000, HQ)[0], LL)
+    check("dead band from good mode", decide(dead, -25.0, 48000, HQ)[0], None)
+    check("just below M_l", decide(enter - 1, -25.0, 48000, HQ)[0], None)
+    check("at M_l", decide(enter, -25.0, 48000, HQ)[0], LL)
+    # from Low Latency: only clearly good content releases it
+    check("stays LL in the dead band", decide(dead, -25.0, 48000, LL)[0], None)
+    check("stays LL on a wall", decide(40.0, -25.0, 48000, LL)[0], None)
+    check("stays LL above M_h", decide(leave + 1, -25.0, 48000, LL)[0], None)
+    check("leaves LL at M_h", decide(leave, -25.0, 48000, LL)[0], HQ)
+    check("leaves LL for 44.1k", decide(0.0, -25.0, 44100, LL)[0], LS)
+    # the good mode tracks the sample rate on every poll, not just at release
+    check("HQ upgrades to Lossless at 44.1k", decide(6.0, -25.0, 44100, HQ)[0], LS)
+    check("Lossless falls to HQ at 48k", decide(6.0, -25.0, 48000, LS)[0], HQ)
+    check("unknown current sets the good mode", decide(6.0, -25.0, 44100, None)[0], LS)
+    # no content
+    check("silence decides nothing", decide(0.0, -80.0, 44100, LS)[0], None)
+    check("unknown rate decides nothing", decide(0.0, -25.0, None, LS)[0], None)
+
+    # Metric end to end: flat noise has no wall, a signal built only from tones
+    # below 15 kHz does.
     rate = 48000
-    length = rate // 5                       # 0.2 s
+    length = rate // 5
     random.seed(7)
     flat = [random.uniform(-0.5, 0.5) for _ in range(length)]
-    flat_db, flat_khz = codec_cliff_db(flat, rate, rate)
-    check("flat noise: no wall", flat_khz is None or flat_db < CLIFF_MIN_STEP_DB,
-          True)
+    flat_step, _pos = wall_step_db(flat, rate, rate)
+    check("flat noise: no wall", flat_step < WALL_ENTER_LL_DB, True)
     walled = [0.0] * length
     tones = 150
     for index in range(1, tones + 1):
@@ -657,13 +705,10 @@ def command_self_test(_args) -> int:
         for i in range(length):
             walled[i] += amplitude * math.sin(
                 2.0 * math.pi * frequency * i / rate + phase)
-    wall_db, wall_khz = codec_cliff_db(walled, rate, rate)
-    check("15 kHz brick wall: detected",
-          wall_db >= CLIFF_MIN_STEP_DB and wall_khz is not None
-          and 14.0 <= wall_khz <= 17.0, True)
-    print(f"  (measured: flat {flat_db:.0f} dB"
-          f"{'' if flat_khz is None else f' at {flat_khz:.0f} kHz'}, "
-          f"walled {wall_db:.0f} dB at {wall_khz:.0f} kHz)")
+    wall_step, wall_pos = wall_step_db(walled, rate, rate)
+    check("15 kHz limited signal: wall found", wall_step >= WALL_ENTER_LL_DB, True)
+    print(f"  (measured step: flat {flat_step:.0f} dB, limited {wall_step:.0f} dB "
+          f"at {wall_pos} kHz)")
     print(f"self-test: {'PASS' if not failures else f'{failures} failure(s)'}")
     return 1 if failures else 0
 
@@ -676,14 +721,18 @@ def _parser() -> argparse.ArgumentParser:
                              "enough and it keeps the reaction time low)")
     parser.add_argument("--interval", type=float, default=0.4,
                         help="seconds between decisions (default 3)")
-    parser.add_argument("--cooldown", type=float, default=2.0,
+    parser.add_argument("--cooldown", type=float, default=3.0,
                         help="seconds to wait after a mode change before the "
                              "next one, so a transition cannot cause churn")
-    parser.add_argument("--debounce", type=int, default=3,
-                        help="identical decisions needed before switching (default 2)")
-    parser.add_argument("--min-step", type=float, default=CLIFF_MIN_STEP_DB,
-                        help="band-to-band step, in dB, at or above which a lossy "
-                             "encoder wall is assumed")
+    parser.add_argument("--enter-ll", type=float, default=WALL_ENTER_LL_DB,
+                        help="M_l: band-to-band step in dB that Low Latency "
+                             "needs before it is entered")
+    parser.add_argument("--leave-ll", type=float, default=WALL_LEAVE_LL_DB,
+                        help="M_h: band-to-band step in dB the content must "
+                             "fall back to before Low Latency is left")
+    parser.add_argument("--confirm", type=float, default=2.5,
+                        help="seconds a new verdict must persist before a mode "
+                             "is written")
     parser.add_argument("--dry-run", action="store_true",
                         help="log decisions without writing to the BT11")
     sub = parser.add_subparsers(dest="command")
