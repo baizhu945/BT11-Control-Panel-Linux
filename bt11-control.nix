@@ -5,10 +5,8 @@ let
     pythonPackages.tkinter
   ]);
 
-  # The auto mode service measures band levels with an FFT, so it needs numpy.
-  analysisPython = pkgs.python3.withPackages (pythonPackages: [
-    pythonPackages.numpy
-  ]);
+  # The auto mode service reads PipeWire metadata only; no DSP dependency is needed.
+  analysisPython = pkgs.python3;
 
   bt11Control = pkgs.runCommand "bt11-control" {
     nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -18,7 +16,7 @@ let
       --add-flags "$out/libexec/bt11-control.py"
   '';
 
-  # Watches the audio going to the BT11 and picks the aptX Adaptive mode.
+  # Watches PipeWire playback sample rates and picks aptX Adaptive mode 3/19.
   bt11AutoMode = pkgs.runCommand "bt11-auto-mode" {
     nativeBuildInputs = [ pkgs.makeWrapper ];
   } ''
@@ -56,7 +54,7 @@ in
   systemd.user.services.bt11-auto-mode = {
     Unit = {
       Description =
-        "Match the FiiO BT11 aptX Adaptive mode to the audio being played";
+        "Match the FiiO BT11 aptX Adaptive mode to the playback sample rate";
       After = [ "pipewire.service" "wireplumber.service" ];
     };
 

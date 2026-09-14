@@ -892,6 +892,42 @@ class Bt11FirmwareUpdater:
         raise Bt11Error(f"BT11 DFU 超时，最后状态为 {state}，已发送 {index}/{len(firmware)} 字节")
 
 
+# --- automatic mode selection ------------------------------------------------
+#
+# bt11-auto-mode (the systemd service) picks the aptX Adaptive mode from the
+# audio being played.  This flag file is how the user switches that off; it is
+# read by both this program and the service, and it works whether or not the
+# BT11 is plugged in.  The same path is duplicated in bt11_auto_mode.py, which
+# deliberately imports nothing from here (this module needs tkinter, the
+# service does not).
+AUTO_MODE_FLAG = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "bt11-control",
+    "auto-mode-disabled",
+)
+
+
+def auto_mode_disabled() -> bool:
+    """True when the user has switched automatic mode selection off."""
+
+    return os.path.exists(AUTO_MODE_FLAG)
+
+
+def set_auto_mode_disabled(disabled: bool) -> bool:
+    """Create or remove the flag file and report the resulting state."""
+
+    if disabled:
+        os.makedirs(os.path.dirname(AUTO_MODE_FLAG), exist_ok=True)
+        with open(AUTO_MODE_FLAG, "w", encoding="utf-8") as handle:
+            handle.write("auto mode selection disabled by bt11-control\n")
+    else:
+        try:
+            os.unlink(AUTO_MODE_FLAG)
+        except FileNotFoundError:
+            pass
+    return auto_mode_disabled()
+
+
 def _format_codecs(names: Iterable[str], unknown: Iterable[int] = ()) -> str:
     values = [CODEC_LABELS.get(name, name) for name in names]
     values.extend(f"unknown(0x{value:02x})" for value in unknown)
@@ -912,6 +948,7 @@ def _print_status(status: DeviceStatus) -> None:
         f"经典蓝牙设备 {status.connected_headsets}; LE 设备 {status.connected_le}"
     )
     print(f"指示灯亮度: {status.brightness}/7")
+    print(f"自动模式选择: {'已禁用（手动控制模式）' if auto_mode_disabled() else '已启用'}")
     print("已配对设备:")
     if not status.paired_devices:
         print("  （无）")
@@ -923,6 +960,19 @@ def _print_status(status: DeviceStatus) -> None:
 def _run_cli(args: argparse.Namespace) -> int:
     if args.command == "gui":
         run_gui(args.device)
+        return 0
+
+    if args.command == "auto-mode":
+        # Deliberately handled before the device is opened: switching the
+        # automatic selection off must work with the dongle unplugged.
+        if args.value is None:
+            print("disabled" if auto_mode_disabled() else "enabled")
+            return 0
+        disabled = (not auto_mode_disabled()) if args.value == "toggle" else (
+            args.value == "off"
+        )
+        set_auto_mode_disabled(disabled)
+        print(f"自动模式选择: {'已禁用' if disabled else '已启用'}")
         return 0
 
     try:
@@ -1015,6 +1065,8 @@ class Bt11Gui:
         self.connection_var = tk.StringVar(value="-")
         self.codec_vars = {name: tk.BooleanVar(value=False) for name in CODEC_LABELS if name != "sbc"}
         self.codec_raw_var = tk.StringVar(value="")
+        self.auto_mode_var = tk.BooleanVar(value=not auto_mode_disabled())
+        self.auto_mode_hint_var = tk.StringVar(value="")
         self.paired: list[PairingDevice] = []
         self.scanned: list[ScanResult] = []
         self._build()
@@ -1080,6 +1132,15 @@ class Bt11Gui:
         self.ldac_combo.grid(row=4, column=1, sticky="w", padx=8, pady=4)
         ttk.Button(codecs, text="写入 LDAC 模式", command=lambda: self.run(self._set_ldac)).grid(row=4, column=2, padx=8, pady=4)
         ttk.Button(codecs, text="写入编码器选择", command=lambda: self.run(self._set_codecs)).grid(row=5, column=0, padx=8, pady=5)
+        ttk.Separator(codecs, orient="horizontal").grid(row=6, column=0, columnspan=3, sticky="ew", padx=8, pady=6)
+        ttk.Checkbutton(
+            codecs,
+            text="按采样率自动选择 aptX Adaptive 模式（Low Latency 时暂停）",
+            variable=self.auto_mode_var,
+            command=self._set_auto_mode,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        ttk.Label(codecs, textvariable=self.auto_mode_hint_var).grid(
+            row=7, column=2, sticky="w", padx=8, pady=4)
 
         pairing = ttk.LabelFrame(content, text="配对与设备")
         pairing.pack(fill="both", expand=True, pady=5)
@@ -1181,6 +1242,12 @@ class Bt11Gui:
         self.aptx_mode_var.set(self._mode_text(status.aptx_mode, APTX_MODES))
         self.ldac_mode_var.set(self._mode_text(status.ldac_mode, LDAC_MODES))
         self.pairing_var.set(PAIRING_MODES.get(status.pairing_mode, str(status.pairing_mode)))
+        self.auto_mode_var.set(not auto_mode_disabled())
+        self.auto_mode_hint_var.set(
+            "自动模式已禁用"
+            if auto_mode_disabled()
+            else "按采样率切换 HQ/Lossless（LL 时暂停）"
+        )
 
     @staticmethod
     def _mode_text(value: Optional[int], mapping: dict[int, str]) -> str:
@@ -1195,6 +1262,17 @@ class Bt11Gui:
 
     def _set_brightness(self):
         return ("brightness", self._with_device(lambda device: device.set_brightness(self.brightness_var.get())))
+
+    def _set_auto_mode(self):
+        """Write the flag file; no device access is needed for this."""
+
+        disabled = set_auto_mode_disabled(not self.auto_mode_var.get())
+        self.auto_mode_var.set(not disabled)
+        self.auto_mode_hint_var.set(
+            "自动模式已禁用"
+            if disabled
+            else "按采样率切换 HQ/Lossless（LL 时暂停）"
+        )
 
     def _set_codecs(self):
         names = [name for name, variable in self.codec_vars.items() if variable.get()]
@@ -1346,6 +1424,9 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("value", nargs="?", type=None if choices is None else int, choices=choices)
     codec = sub.add_parser("codecs", help="读取或设置可用 codec")
     codec.add_argument("value", nargs="*", choices=sorted(set(USER_CODEC_NAMES) | {"sbc"}), help="不提供则读取；提供一个或多个则写入")
+    auto_mode = sub.add_parser("auto-mode", help="启用/禁用自动模式选择")
+    auto_mode.add_argument("value", nargs="?", choices=["on", "off", "toggle"],
+                           help="不提供则读取当前状态")
     sub.add_parser("devices", help="列出已配对设备")
     for command_name in ("connect", "disconnect", "pair", "forget"):
         command = sub.add_parser(command_name)

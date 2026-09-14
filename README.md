@@ -12,6 +12,7 @@ interface 1 工作。它不依赖 Chromium 的 WebHID，因此可以在 Linux �
 - 选择可用 codec：LDAC、aptX Adaptive、aptX HD、aptX、aptX LL（SBC 是 BT11 的基础 codec）
 - 选择 LDAC 模式：High Quality、Standard Quality、Mobile Quality
 - 选择 aptX Adaptive 模式：Low Latency、High Quality、aptX Lossless
+- **启用/禁用自动模式选择**（即 bt11-auto-mode 服务是否按采样率改模式）
 - 配对模式：关闭、自动、手动
 - 读取、连接、断开和删除已配对设备
 - 扫描附近设备，并将扫描结果配对后连接
@@ -30,53 +31,35 @@ bt11-control firmware-update /path/to/BT11.bin --yes
 
 ## 自动模式服务（systemd）
 
-`bt11-auto-mode` 持续观察**真正送给 BT11 的音频**，据此选择 aptX Adaptive 模式：
+`bt11-auto-mode` **只读取正在送往 BT11 的 PipeWire 播放流采样率**，不抓取 PCM，
+不检测音频质量、编码格式、码率，也不会自动选择 Low Latency：
 
-| 播放内容 | 目标模式 |
+| 已知播放采样率 | 目标模式 |
 | --- | --- |
-| 无损 / 近无损，且源采样率 44.1 kHz | `19` aptX Lossless |
-| 无损 / 近无损，其它采样率 | `3` High Quality |
-| 有损内容 | `2` Low Latency |
+| 44.1 kHz（44100）或 88.2 kHz（88200） | `19` aptX Lossless |
+| 其它正数采样率 | `3` High Quality |
+| 没有播放流或所有流的采样率未知 | 不改变当前模式 |
 
-判定方式（**只看音频本身**，不看是哪个播放器）：从 BT11 的 PipeWire monitor 抓
-1.2 秒 PCM 做 FFT，在 8 kHz 以上按 **1 kHz 带宽**统计各带能量，取**相邻带之间的最大
-台阶**（step）。有损编码器在截止频率处是一条砖墙（台阶几十 dB），无损内容即使音乐
-偏暗也只是平缓滚降（实测 ≤4 dB）。台阶只统计到 **19 kHz**：44.1 kHz 的源被重采样到
-48 kHz 后会在 22.05 kHz 结束，Chromium 的过渡带在 20–21 kHz 会产生一个 **19 dB** 的
-假台阶，正好落进有损区间 —— 因此把 19 kHz 以上排除掉。
+服务每轮先读取 BT11 当前 aptX Adaptive 模式：
 
-本机实测分布（服务日志 + 直接抓包）：
+- 当前是 `2` Low Latency：自动逻辑暂停，不读取音频图，也不切回 High Quality/Lossless；
+  服务继续等待，用户手动改回 `3` 或 `19` 后才恢复；
+- 当前是 `3` 或 `19`：允许只在这两个模式之间按采样率切换；
+- 当前模式未知或为其它值：为安全起见不写入；
+- 写入前再次读取当前模式，避免覆盖用户刚刚手动选择的 Low Latency。
 
-| 内容 | step |
-|---|---|
-| 无损 PCM 44.1 / 48 kHz | 0.3 – 0.5 dB |
-| Chromium 播 44.1 kHz 无损 | 0.5 dB |
-| **Spotify 无损（真实音乐，多轮实测）** | **3.8 – 15 dB**（中位约 5） |
-| **Bilibili HiRes（Chromium，AAC）** | **22 – 55 dB** |
-| MP3 128k / AAC 128k | 66 / 54 dB |
+播放流来自连接到 BT11 sink 的、状态为 `running` 的 PipeWire links；采样率优先取
+流的 `node.rate`，其次取 `audio.rate`。多个流同时播放时，优先采用最高的、不是
+44.1/88.2 kHz 的已知采样率；如果没有其它速率，才采用最高的 44.1/88.2 kHz 速率。
+因此所有已知流都是 44.1/88.2 kHz 才选 Lossless，只要存在其它已知采样率就选 High
+Quality；所有流都未知则不作决定。
 
-真实音乐把"粉噪声标定"给出的 18 dB 间隔压缩到约 **7 dB**（Spotify 最高 ~15 dB，
-Bilibili 最低 ~22 dB），所以阈值必须放在这个窄缝里，并利用**代价不对称**：误进
-Low Latency 会损失音质，而该进未进只是延迟略高、不损失音质 —— 因此偏向"不轻易进"。
-
-**判据用可变阈值（施密特触发）**，两类之间留出 8–16 dB 的死区：
-
-- **M_l**：进入 Low Latency 需要 step **≥ 20 dB**（质量明显变差才降级）；
-- **M_h**：从 Low Latency 返回，需要 step **≤ 12 dB**（质量明显恢复才升级）；
-- 落在 **12–20 dB** 之间**不改变当前模式** —— 这是防横跳的关键（每次切换都要重协商
-  蓝牙链路，会听到中断）；死区也带来一个好处：Bilibili 只要有一段明确落墙就进入
-  Low Latency，之后即便某几段台阶掉进死区也会**留在** Low Latency，不会来回跳。
-
-按你的说法：切到 Low Latency 后要"音质达到更高的阈值 M_h"才切回，切到
-High Quality/Lossless 后要"音质低到 M_l"才切到 Low Latency。
-
-**采样率（44.1 vs 其它）是确定事实，因此每一轮都会重新比对**：只要当前模式不是该
-采样率对应的那个（44.1 kHz → Lossless，其它 → High Quality），就会切过去 —— 不再
-只在"离开 Low Latency 的那一刻"决定一次（那会导致一旦落到 High Quality 就再也升
-不回 Lossless）。
-
-源采样率取**正在播放的 PipeWire 流的 `node.rate`**（例如 `1/44100`），不是 BT11
-设备的 48 kHz —— 设备速率是所有内容重采样后的结果，无法反映内容本身。
+**手动开关**：GUI 里「Bluetooth 编码器」区域有一个复选框，CLI 用
+`bt11-control auto-mode on|off|toggle`。开关状态保存在
+`$XDG_STATE_HOME/bt11-control/auto-mode-disabled`（默认
+`~/.local/state/bt11-control/auto-mode-disabled`）：文件存在 = 已禁用。服务每轮都读
+它，禁用期间**只记录日志、不改模式**；`once --apply` 在禁用时会拒绝写入。拔掉 BT11
+时也能切换，服务由 path 单元重新启动后仍遵守该状态。
 
 服务与唤醒方式：
 
@@ -89,39 +72,20 @@ High Quality/Lossless 后要"音质低到 M_l"才切到 Low Latency。
 手动调试：
 
 ```text
-bt11-auto-mode once              # 读一次并打印判定（不写入设备）
-bt11-auto-mode once --apply      # 读一次并立即写入
-bt11-auto-mode run --dry-run     # 跑服务循环但只打印
-bt11-auto-mode self-test         # 判定逻辑 + 检测器自检（含合成砖墙）
+bt11-auto-mode once              # 读一次采样率并打印判定（不写入设备）
+bt11-auto-mode once --apply      # 读一次并立即写入 3/19（LL 时不写）
+bt11-auto-mode run --dry-run     # 跑服务循环但只打印，不写入设备
+bt11-auto-mode self-test         # 采样率映射与 LL 保护自检
 bt11-auto-mode analyse file.wav [--content-rate 44100]
-bt11-auto-mode --min-step 40 run
 ```
 
-可调参数：`--enter-ll`（M_l，进入 Low Latency 的台阶阈值，默认 16 dB）、
-`--leave-ll`（M_h，返回所需的台阶阈值，默认 8 dB）、`--confirm`（新判定需持续的
-秒数，默认 2.5）、`--seconds`（分析窗长，默认 1.2）、`--interval`（轮询间隔，
-默认 0.4）、`--cooldown`（切换后的冷却，默认 3 s）。
+可调参数只有去抖和轮询参数：`--confirm`（新采样率判定需持续的秒数，默认 1）、
+`--interval`（轮询间隔，默认 0.4）、`--cooldown`（切换后的冷却，默认 3 s）。服务
+只查询 PipeWire 元数据，因此不会启动 `pw-record`，也不需要 numpy。
 
-**反应速度**：程序**持续**采集 monitor 到环形缓冲，每次轮询分析最近 1.2 s，
-因此判定几乎无等待。实测本机：
-
-| 环节 | 耗时 |
-|---|---|
-| BT11 HID 读 / 写（`bt11-control aptx-mode`） | 0.12 s / **0.14 s** |
-| 检测到新内容并写入新模式（含静置与去抖） | **1.5–2.7 s**（早期版本约 18 s） |
-| 之后的蓝牙链路重协商 | 由 BT11 + 耳机决定，主机侧无法测量 |
-
-切换瞬间（换播放器、播放/停止）会有一段时间窗内是"新旧混合"的音频，因此程序在
-**流集合发生变化后先静置一个窗口**再判定，并在写入后**冷却 2 s**，避免来回翻转
-（早期版本确实会 19↔2 反复切换，日志可见）。
-`analyse` 的 `--content-rate` 用于分析"重采样后的抓包"：不给出时会用文件自身速率，
-44.1 kHz 源的上限就会被误当成砖墙。
-
-已知限制（都是频谱类判据的固有歧义，死区保证它们至少"稳定"而非反复横跳）：
-**1)** 从有损转码而来的"无损文件"会被判成无损；**2)** 截止频率高于 19 kHz 的有损
-编码（如 320k AAC/MP3，墙在 20–21 kHz）会被判成无损 → 走 High Quality（只是延迟
-略高，音质无损）；**3)** 母带本身只到 16–19 kHz 的无损文件会被判成有损。
-空闲（没有流在播）时不改动当前模式。
+已知限制：播放器或 PipeWire 若已将不同源采样率重采样，服务只能看到重采样后的
+`node.rate`；多个播放流混音时只能采用上述保守的非 Lossless 速率优先规则；未知采样
+率时不改变模式。空闲（没有流在播）时同样不改变当前模式。
 
 ## 运行
 
