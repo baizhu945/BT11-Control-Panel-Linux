@@ -148,23 +148,34 @@ class SampleRateModeTests(unittest.TestCase):
         self.assertIsNone(bt11_auto_mode._parse_rate(0))
 
     def test_mixed_stream_rate_is_conservative(self):
+        stream = bt11_auto_mode.Stream
         self.assertEqual(
-            bt11_auto_mode.content_rate([("44.1k", 44100), ("88.2k", 88200)]),
+            bt11_auto_mode.content_rate([
+                stream(("a", ""), "a", 44100),
+                stream(("b", ""), "b", 88200),
+            ]),
             88200,
         )
         self.assertEqual(
             bt11_auto_mode.mode_for_rate(
-                bt11_auto_mode.content_rate([("44.1k", 44100), ("48k", 48000)])
+                bt11_auto_mode.content_rate([
+                    stream(("a", ""), "a", 44100),
+                    stream(("b", ""), "b", 48000),
+                ])
             ),
             3,
         )
         self.assertEqual(
             bt11_auto_mode.mode_for_rate(
-                bt11_auto_mode.content_rate([("32k", 32000), ("44.1k", 44100)])
+                bt11_auto_mode.content_rate([
+                    stream(("a", ""), "a", 32000),
+                    stream(("b", ""), "b", 44100),
+                ])
             ),
             3,
         )
-        self.assertIsNone(bt11_auto_mode.content_rate([("unknown", None)]))
+        self.assertIsNone(
+            bt11_auto_mode.content_rate([stream(("a", ""), "a", None)]))
 
     def test_active_playback_filters_and_deduplicates_links(self):
         document = [
@@ -194,10 +205,87 @@ class SampleRateModeTests(unittest.TestCase):
             {"type": "PipeWire:Interface:Link", "info": {"input-node-id": 10, "output-node-id": 10}},
             {"type": "PipeWire:Interface:Link", "info": {"input-node-id": 99, "output-node-id": 40}},
         ]
+        players = bt11_auto_mode.active_playback(document, 10)
+        self.assertEqual([player.pair() for player in players], [("player", 44100)])
+        self.assertEqual(players[0].key, ("player", ""))
+        self.assertEqual(bt11_auto_mode.players_text(players),
+                         "[('player', 44100)]")
+
+    def test_stream_key_survives_node_id_changes(self):
+        document = [
+            {
+                "id": 10,
+                "type": "PipeWire:Interface:Node",
+                "info": {"props": {"media.class": "Audio/Sink", "node.name": "BT11"}},
+            },
+            {
+                "id": 77,
+                "type": "PipeWire:Interface:Node",
+                "info": {
+                    "state": "running",
+                    "props": {"node.name": "Spotify", "application.name": "Spotify",
+                              "node.rate": "1/44100"},
+                },
+            },
+            {"type": "PipeWire:Interface:Link", "info": {"input-node-id": 10, "output-node-id": 77}},
+        ]
         self.assertEqual(
-            bt11_auto_mode.active_playback(document, 10),
-            [("player", 44100)],
+            bt11_auto_mode.active_playback(document, 10)[0].key,
+            ("Spotify", "Spotify"),
         )
+
+
+class SessionTrackerTests(unittest.TestCase):
+    """A notification at another rate must not disturb a running session."""
+
+    MUSIC = frozenset({("mpv", "mpv")})
+    OTHER = frozenset({("pw-play", "pw-play")})
+
+    def setUp(self):
+        self.tracker = bt11_auto_mode.SessionTracker(idle_grace=2.0)
+
+    def test_extra_stream_does_not_change_the_session_rate(self):
+        self.assertEqual(self.tracker.update(self.MUSIC, 44100, 0.0), "started")
+        self.assertEqual(
+            self.tracker.update(self.MUSIC | self.OTHER, 48000, 0.5), "continues")
+        self.assertEqual(self.tracker.target_rate, 44100)
+
+    def test_reverse_case_keeps_high_quality_session(self):
+        self.assertEqual(self.tracker.update(self.OTHER, 48000, 0.0), "started")
+        self.assertEqual(
+            self.tracker.update(self.OTHER | self.MUSIC, 44100, 0.5), "continues")
+        self.assertEqual(self.tracker.target_rate, 48000)
+
+    def test_new_playback_after_silence_decides_again(self):
+        self.tracker.update(self.MUSIC, 44100, 0.0)
+        self.assertEqual(self.tracker.update(frozenset(), None, 1.0), "fading")
+        self.assertEqual(self.tracker.update(frozenset(), None, 4.0), "ended")
+        self.assertEqual(self.tracker.update(self.OTHER, 48000, 5.0), "started")
+        self.assertEqual(self.tracker.target_rate, 48000)
+
+    def test_short_gap_keeps_the_session(self):
+        self.tracker.update(self.MUSIC, 44100, 0.0)
+        self.assertEqual(self.tracker.update(frozenset(), None, 1.0), "fading")
+        self.assertEqual(self.tracker.update(self.MUSIC, 44100, 1.5), "continues")
+        self.assertEqual(self.tracker.target_rate, 44100)
+
+    def test_handover_needs_the_grace_before_switching(self):
+        self.tracker.update(self.MUSIC, 44100, 0.0)
+        self.assertEqual(self.tracker.update(self.OTHER, 48000, 0.5), "fading")
+        self.assertEqual(self.tracker.target_rate, 44100)
+        self.assertEqual(self.tracker.update(self.OTHER, 48000, 3.0), "replaced")
+        self.assertEqual(self.tracker.target_rate, 48000)
+
+    def test_unknown_rate_is_adopted_when_it_becomes_known(self):
+        self.assertEqual(self.tracker.update(self.MUSIC, None, 0.0), "started")
+        self.assertIsNone(self.tracker.target_rate)
+        self.assertEqual(
+            self.tracker.update(self.MUSIC, 44100, 0.4), "rate-known")
+        self.assertEqual(self.tracker.target_rate, 44100)
+
+    def test_idle_without_session(self):
+        self.assertEqual(self.tracker.update(frozenset(), None, 0.0), "idle")
+        self.assertFalse(self.tracker.active)
 
 
 class AutoModeFlagTests(unittest.TestCase):

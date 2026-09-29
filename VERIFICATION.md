@@ -40,10 +40,29 @@ running PipeWire playback links connected to the BT11 sink:
 | Any other positive rate | `3` High Quality |
 | No stream / no known rate | no change |
 
-For multiple active streams, a known non-44.1/88.2 rate is preferred over the
-lossless rates, and the highest such rate is used. Thus 44.1 + 88.2 kHz remains
-Lossless, while 44.1 + 48 kHz and 44.1 + 32 kHz select High Quality. If all
-rates are unknown, the service makes no decision.
+For multiple active streams at the moment a session starts, a known
+non-44.1/88.2 rate is preferred over the lossless rates, and the highest such
+rate is used. Thus 44.1 + 88.2 kHz remains Lossless, while 44.1 + 48 kHz and
+44.1 + 32 kHz select High Quality. If all rates are unknown, the service makes
+no decision.
+
+### The rate is latched per playback session
+
+The rate is read once, when playback starts, and the streams that started it
+are remembered as the session's own streams:
+
+- A stream that joins a running session never changes the mode. 44.1 kHz music
+  with a 48 kHz notification sound mixed in stays on Lossless, and 48 kHz video
+  with a 44.1 kHz notification stays on High Quality. This is what prevents the
+  audible interruption caused by a link re-negotiation.
+- The session ends only after its own streams have been gone for `--idle-grace`
+  seconds (default 1.5 s). The playback that runs *then* starts a fresh session
+  and decides the mode, which implements "48 kHz that starts while nothing else
+  is playing switches the mode", and the reverse.
+- A momentary dropout shorter than the grace keeps the session, so a
+  notification landing in that gap cannot change the mode either.
+- Streams are identified by `node.name`/`application.name`, not by PipeWire node
+  id, so a player re-creating its node does not end the session.
 
 The state machine is deliberately fail-closed:
 
@@ -57,10 +76,10 @@ The state machine is deliberately fail-closed:
 - An unknown current mode or a failed mode read causes no write.
 - The `auto-mode-disabled` flag remains a higher-priority manual override.
 
-The service still uses a short confirmation interval and post-write cooldown
-for stream/rate transitions. These are timing guards only; they are not audio
-quality thresholds. The service no longer starts `pw-record`, keeps an audio
-buffer, or imports numpy.
+The service still uses a short confirmation interval (a ding that lasts less
+than `--confirm` seconds cannot rewrite the mode) and a post-write cooldown.
+These are timing guards only; they are not audio quality thresholds. The service
+does not start `pw-record`, keep an audio buffer, or import numpy.
 
 ## Automated checks for the current policy
 
@@ -72,6 +91,9 @@ The test suite covers:
 - current Low Latency and unknown/unsupported current modes -> no write;
 - `node.rate` fraction parsing, malformed rates, and conservative mixed-stream
   handling (including 44.1 + 32 kHz);
+- session latching: a 48 kHz insert over 44.1 kHz keeps 44.1 kHz and vice versa,
+  a short gap keeps the session, a new rate after the grace starts a new
+  session, and a stream key survives node id changes;
 - the automatic-mode flag round trip and idempotence;
 - the existing BT11 HID protocol layout and command behavior.
 
@@ -108,18 +130,55 @@ set.
 - The service can only see the rate exposed by the active PipeWire playback
   stream. If a player or PipeWire has already resampled the source, the
   original rate is not recoverable here.
-- With multiple streams, the documented highest-known-rate policy is a
-  conservative choice for the mixed signal.
+- While a session runs, every stream that joins it is ignored by design; that is
+  what stops a notification sound from interrupting the music.
 - A missing or malformed rate never causes a mode write.
 - Bluetooth link renegotiation time after a mode write is controlled by the
   BT11 and receiver, not by this metadata-only detector.
 
 ## Current execution result
 
-- `python3 -m unittest -v`: **19 tests passed**.
+- `python3 -m unittest -v`: **27 tests passed**.
 - `bt11-auto-mode self-test`: **PASS**.
-- `home-manager build switch`: **exit 0**.
-- The active user service uses the new metadata-only executable and has no
-  `pw-record` child. At verification time the hardware was already in mode `2`
-  (Low Latency), so the service logged that automatic switching was paused and
-  left the mode unchanged.
+- `home-manager build switch -I home-manager=<channel>`: **exit 0** (see the
+  environment note below).
+- The active user service runs the metadata-only executable and has no
+  `pw-record` child.
+
+### Live session test (2026-09-29, BT11 + MOMENTUM 5, aptX Adaptive)
+
+Players were mpv (44.1 kHz WAV) and pw-play (48 kHz WAV) pointed at the BT11
+sink, with the mode read back from the dongle itself after every step:
+
+| step | players | mode before | mode after |
+| --- | --- | --- | --- |
+| 1 | mpv 44.1 kHz | 3 | **19** Lossless |
+| 2 | mpv 44.1 kHz + pw-play 48 kHz inserted | 19 | **19** (unchanged) |
+| 3 | all playback stopped | 19 | **19** (unchanged) |
+| 4 | pw-play 48 kHz alone | 19 | **3** High Quality |
+| 5 | pw-play 48 kHz + mpv 44.1 kHz inserted | 3 | **3** (unchanged) |
+
+The service log for steps 1-2 shows the mechanism directly:
+
+```text
+playback started: players=[('mpv', 44100)] session rate=44100 Hz
+session rate=44100 Hz players=[('mpv', 44100)] current=3 (High Quality) -> 44100 Hz -> aptX Lossless
+mode 3 -> 19 (aptX Lossless)
+playback continues: players=[('mpv', 44100), ('pw-play', 48000)]; keeping the mode for session rate=44100 Hz
+session rate=44100 Hz players=[('mpv', 44100), ('pw-play', 48000)] current=19 (aptX Lossless) -> 44100 Hz -> aptX Lossless; mode already matches
+```
+
+Pausing mpv was checked separately: its stream leaves the BT11 sink links
+entirely, so a paused player does not hold a session open.
+
+### Environment note
+
+`home-manager build switch` currently fails in a plain shell with
+`error: file 'home-manager/home-manager/home-manager.nix' was not found in the
+Nix search path`. The system `nix.conf` sets an explicit `nix-path` (root
+channels only) and `pure-eval`, so `$NIX_PATH`'s user-channel entry is ignored
+and `<home-manager>` no longer resolves. Passing the channel explicitly works:
+
+```text
+home-manager build switch -I home-manager=$(readlink -f ~/.nix-defexpr/channels/home-manager)
+```

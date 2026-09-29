@@ -40,6 +40,23 @@ bt11-control firmware-update /path/to/BT11.bin --yes
 | 其它正数采样率 | `3` High Quality |
 | 没有播放流或所有流的采样率未知 | 不改变当前模式 |
 
+### 采样率按「播放会话」读取，而不是每轮重算
+
+采样率只在**一段播放刚开始时**读一次，之后这段播放的流被记为这次会话的主人：
+
+- 会话进行中**再插入别的流不会改变模式** —— 例如 Spotify 正在播 44.1 kHz 无损时来了
+  一个 48 kHz 提示音，模式**保持 Lossless**，音乐不被打断；反过来 48 kHz 视频正在播放
+  时插入 44.1 kHz 提示音，模式同样**保持 High Quality**。
+- 只有**会话自己的那些流全部消失**（默认持续 1.5 s，即 `--idle-grace`）之后，才由
+  **下一段播放**重新决定模式。也就是说："没有音频在播时开始播放 48 kHz" 才会切到
+  High Quality，反之亦然。
+- 短暂的播放中断（播放器卡一下）不会结束会话，因此正好落在这个空隙里的提示音也不会
+  触发切换。
+- 播放器换曲而流一直不断时，会话继续，模式不变；完全停掉再播放别的，才重新判定。
+
+流用 `node.name`/`application.name` 作为身份，不用 PipeWire 的节点 id：播放器重建节点
+（id 变化）不会让会话误判为结束。
+
 服务每轮先读取 BT11 当前 aptX Adaptive 模式：
 
 - 当前是 `2` Low Latency：自动逻辑暂停，不读取音频图，也不切回 High Quality/Lossless；
@@ -49,10 +66,10 @@ bt11-control firmware-update /path/to/BT11.bin --yes
 - 写入前再次读取当前模式，避免覆盖用户刚刚手动选择的 Low Latency。
 
 播放流来自连接到 BT11 sink 的、状态为 `running` 的 PipeWire links；采样率优先取
-流的 `node.rate`，其次取 `audio.rate`。多个流同时播放时，优先采用最高的、不是
-44.1/88.2 kHz 的已知采样率；如果没有其它速率，才采用最高的 44.1/88.2 kHz 速率。
-因此所有已知流都是 44.1/88.2 kHz 才选 Lossless，只要存在其它已知采样率就选 High
-Quality；所有流都未知则不作决定。
+流的 `node.rate`，其次取 `audio.rate`。**会话开始时**若有多个流同时存在，优先采用最高
+的、不是 44.1/88.2 kHz 的已知采样率；如果没有其它速率，才采用最高的 44.1/88.2 kHz
+速率。因此所有已知流都是 44.1/88.2 kHz 才选 Lossless，只要存在其它已知采样率就选
+High Quality；所有流都未知则不作决定（等它读出采样率再判）。
 
 **手动开关**：GUI 里「Bluetooth 编码器」区域有一个复选框，CLI 用
 `bt11-control auto-mode on|off|toggle`。开关状态保存在
@@ -75,17 +92,18 @@ Quality；所有流都未知则不作决定。
 bt11-auto-mode once              # 读一次采样率并打印判定（不写入设备）
 bt11-auto-mode once --apply      # 读一次并立即写入 3/19（LL 时不写）
 bt11-auto-mode run --dry-run     # 跑服务循环但只打印，不写入设备
-bt11-auto-mode self-test         # 采样率映射与 LL 保护自检
+bt11-auto-mode self-test         # 采样率映射、会话规则与 LL 保护自检
 bt11-auto-mode analyse file.wav [--content-rate 44100]
 ```
 
-可调参数只有去抖和轮询参数：`--confirm`（新采样率判定需持续的秒数，默认 1）、
-`--interval`（轮询间隔，默认 0.4）、`--cooldown`（切换后的冷却，默认 3 s）。服务
-只查询 PipeWire 元数据，因此不会启动 `pw-record`，也不需要 numpy。
+可调参数：`--idle-grace`（会话自己的流消失多久后允许下一段播放重新决定，默认 1.5 s）、
+`--confirm`（新会话的判定需持续的秒数，默认 1）、`--interval`（轮询间隔，默认 0.4）、
+`--cooldown`（切换后的冷却，默认 3 s）。服务只查询 PipeWire 元数据，因此不会启动
+`pw-record`，也不需要 numpy。
 
 已知限制：播放器或 PipeWire 若已将不同源采样率重采样，服务只能看到重采样后的
-`node.rate`；多个播放流混音时只能采用上述保守的非 Lossless 速率优先规则；未知采样
-率时不改变模式。空闲（没有流在播）时同样不改变当前模式。
+`node.rate`；会话进行中新增的流一律只按"不改变模式"处理（这正是防打断的关键）；
+未知采样率时不改变模式；空闲（没有流在播）时同样不改变当前模式。
 
 ## 运行
 

@@ -15,6 +15,13 @@ mode is Low Latency, automatic rate selection is paused and the mode is left
 alone.  The service keeps polling in that state so it can resume if the user
 manually changes back to High Quality or Lossless.
 
+The sample rate is read once per *playback session*, not on every poll.  A
+session starts when audio begins to play and its owning streams are recorded;
+while at least one of those streams keeps playing, extra streams (a 48 kHz
+notification sound over 44.1 kHz music, or the other way round) are ignored and
+the mode is left alone.  Only when the session's own streams have been gone for
+``--idle-grace`` seconds does the next playback choose the mode again.
+
 It is started by a systemd path unit when the BT11 is plugged in and exits as
 soon as the dongle disappears.  No audio capture, FFT, quality classifier, or
 third-party Python package is needed.
@@ -29,6 +36,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import re
@@ -49,6 +57,11 @@ APTX_HIGH_QUALITY = 3
 APTX_LOSSLESS = 19
 APTX_GOOD_MODES = frozenset({APTX_HIGH_QUALITY, APTX_LOSSLESS})
 LOSSLESS_SAMPLE_RATES = frozenset({44100, 88200})
+
+# How long the streams of a playback session may be absent before the session
+# is considered over.  It absorbs a player's momentary hiccup so that a
+# notification landing in that gap cannot change the mode.
+DEFAULT_IDLE_GRACE = 1.5
 MODE_NAMES = {
     APTX_LOW_LATENCY: "Low Latency",
     APTX_HIGH_QUALITY: "High Quality",
@@ -162,15 +175,42 @@ def find_sink(document: list) -> tuple[int, str] | None:
     return None
 
 
-def active_playback(document: list, sink_id: int) -> list[tuple[str, int | None]]:
-    """Return (name, sample rate) for every running stream feeding the sink."""
+@dataclasses.dataclass(frozen=True)
+class Stream:
+    """One running playback stream feeding the BT11 sink."""
+
+    key: tuple[str, str]   # (node.name, application.name): stable across id churn
+    name: str              # what the logs show
+    rate: int | None       # node.rate / audio.rate, in Hz
+
+    def pair(self) -> tuple[str, int | None]:
+        return (self.name, self.rate)
+
+
+def _stream_key(props: dict, peer_id: int) -> tuple[str, str]:
+    """Identify a stream by name, not by node id.
+
+    PipeWire node ids change whenever a player recreates its stream, while
+    node.name/application.name survive that.  A session must not be considered
+    over just because a player re-created its node.
+    """
+
+    node_name = str(props.get("node.name") or "")
+    app_name = str(props.get("application.name") or "")
+    if not node_name and not app_name:
+        return (f"id:{peer_id}", "")
+    return (node_name, app_name)
+
+
+def active_playback(document: list, sink_id: int) -> list[Stream]:
+    """Return every running stream feeding the sink, with its sample rate."""
 
     nodes = {
         item["id"]: item
         for item in document
         if item.get("type") == "PipeWire:Interface:Node"
     }
-    found: dict[int, tuple[str, int | None]] = {}
+    found: dict[int, Stream] = {}
     for item in document:
         if item.get("type") != "PipeWire:Interface:Link":
             continue
@@ -189,11 +229,18 @@ def active_playback(document: list, sink_id: int) -> list[tuple[str, int | None]
         name = str(props.get("node.name") or props.get("application.name") or peer_id)
         rate = _parse_rate(props.get("node.rate")) or _parse_rate(props.get("audio.rate"))
         # One entry per stream: each stream has one link per channel.
-        found[peer_id] = (name, rate)
+        found[peer_id] = Stream(key=_stream_key(props, peer_id), name=name, rate=rate)
     return list(found.values())
 
 
-def content_rate(players: list[tuple[str, int | None]]) -> int | None:
+def players_text(players: list[Stream]) -> str:
+    """Compact rendering used in the log lines."""
+
+    return "[" + ", ".join(
+        f"({player.name!r}, {player.rate})" for player in players) + "]"
+
+
+def content_rate(players: list[Stream]) -> int | None:
     """Return an effective rate for all known streams feeding the BT11.
 
     PipeWire can mix more than one playback stream.  If any known stream uses
@@ -204,11 +251,80 @@ def content_rate(players: list[tuple[str, int | None]]) -> int | None:
     Lossless.  Unknown streams are ignored; an all-unknown set returns None.
     """
 
-    rates = [rate for _name, rate in players if rate is not None and rate > 0]
+    rates = [player.rate for player in players
+             if player.rate is not None and player.rate > 0]
     if not rates:
         return None
     non_lossless = [rate for rate in rates if rate not in LOSSLESS_SAMPLE_RATES]
     return max(non_lossless or rates)
+
+
+class SessionTracker:
+    """Decide which sample rate owns the current playback session.
+
+    The mode follows the audio that *started* a session, not whatever happens
+    to be mixed into it later.  While at least one stream of the session keeps
+    playing, the session rate is frozen, so a 48 kHz notification over 44.1 kHz
+    music (or the reverse) cannot change the mode.  The session ends once its
+    own streams have been absent for ``idle_grace`` seconds; the playback that
+    is running then starts a fresh session and picks the mode.
+    """
+
+    def __init__(self, idle_grace: float = DEFAULT_IDLE_GRACE):
+        self.idle_grace = max(0.0, float(idle_grace))
+        self.keys: frozenset[tuple[str, str]] | None = None
+        self.rate: int | None = None
+        self.absent_since: float | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.keys is not None
+
+    @property
+    def target_rate(self) -> int | None:
+        return self.rate
+
+    def _start(self, keys, rate: int | None) -> None:
+        self.keys = frozenset(keys)
+        self.rate = rate
+        self.absent_since = None
+
+    def _end(self) -> None:
+        self.keys, self.rate, self.absent_since = None, None, None
+
+    def update(self, keys, rate: int | None, now: float) -> str:
+        """Advance the state machine and describe what happened.
+
+        Events: ``idle`` (nothing playing, no session), ``started`` (a session
+        began), ``continues`` (the session's own audio is still playing),
+        ``rate-known`` (a session with an unknown rate learned it), ``fading``
+        (the session's audio stopped, but not for long enough yet), ``ended``
+        (the session ended and nothing is playing), ``replaced`` (the session
+        ended and different audio is playing).
+        """
+
+        keys = frozenset(keys)
+        if self.keys is not None:
+            if keys & self.keys:
+                self.absent_since = None
+                if self.rate is None and rate is not None:
+                    self.rate = rate
+                    return "rate-known"
+                return "continues"
+            # None of this session's own streams is playing any more.
+            if self.absent_since is None:
+                self.absent_since = now
+            if now - self.absent_since < self.idle_grace:
+                return "fading"
+            self._end()
+            if keys:
+                self._start(keys, rate)
+                return "replaced"
+            return "ended"
+        if not keys:
+            return "idle"
+        self._start(keys, rate)
+        return "started"
 
 
 # --- sample-rate decision ---------------------------------------------------
@@ -305,6 +421,10 @@ def _mode_text(mode: int | None) -> str:
     return "unknown" if mode is None else f"{mode} ({MODE_NAMES.get(mode, 'unknown')})"
 
 
+def _rate_text(rate: int | None) -> str:
+    return "unknown" if rate is None else f"{rate} Hz"
+
+
 def command_once(args) -> int:
     if auto_mode_disabled():
         log("automatic mode selection is disabled")
@@ -327,8 +447,8 @@ def command_once(args) -> int:
     rate = content_rate(players)
     current = current_mode()
     mode, reason, _label = decide(rate, current)
-    rate_text = "unknown" if rate is None else f"{rate} Hz"
-    log(f"players={players} rate={rate_text} current={_mode_text(current)} -> {reason}")
+    log(f"players={players_text(players)} rate={_rate_text(rate)} "
+        f"current={_mode_text(current)} -> {reason}")
     if mode is None:
         return 0
 
@@ -362,9 +482,9 @@ def command_run(args) -> int:
         log("BT11 is not plugged in; exiting so the path unit can re-arm")
         return 0
     log(
-        f"watching the BT11 (sample-rate-only, interval {args.interval}s, "
-        f"confirm {args.confirm}s, cooldown {args.cooldown}s, "
-        f"apply={not args.dry_run})"
+        f"watching the BT11 (sample rate per playback session, interval "
+        f"{args.interval}s, confirm {args.confirm}s, cooldown {args.cooldown}s, "
+        f"idle grace {args.idle_grace}s, apply={not args.dry_run})"
     )
 
     last_message: str | None = None
@@ -372,6 +492,7 @@ def command_run(args) -> int:
     candidate: int | None = None
     candidate_since = 0.0
     next_allowed = 0.0
+    tracker = SessionTracker(args.idle_grace)
 
     while True:
         if not device_present():
@@ -438,27 +559,57 @@ def command_run(args) -> int:
             _sleep_interval(args.interval)
             continue
 
+        now = time.monotonic()
         rate = content_rate(players)
-        player_key = tuple(sorted(players))
-        if player_key != last_players:
-            # A stream change can briefly expose stale graph metadata.  The
-            # confirmation timer is enough; no PCM settling window is needed
-            # because the decision uses metadata only.
-            last_players = player_key
-            candidate, candidate_since = None, 0.0
+        event = tracker.update({player.key for player in players}, rate, now)
+        session_rate = tracker.target_rate
+        player_key = tuple(sorted(player.pair() for player in players))
 
-        if not players or rate is None:
-            candidate, candidate_since = None, 0.0
+        # The session rate belongs to the audio that started the session.  Any
+        # stream that joins later -- a notification sound at another rate, for
+        # instance -- is deliberately ignored until the session is over.
+        if event in {"started", "replaced", "rate-known"}:
+            last_message = "session"
+            headline = {
+                "started": "playback started",
+                "replaced": "new playback started",
+                "rate-known": "session sample rate is now known",
+            }[event]
+            log(f"{headline}: players={players_text(players)} "
+                f"session rate={_rate_text(session_rate)}")
+        elif event == "ended":
+            last_message = "idle"
+            log("playback ended; the next playback start chooses the mode")
+        elif event == "idle":
             if last_message != "idle":
-                log("idle: no running stream with a known sample rate")
                 last_message = "idle"
+                log("idle: nothing is playing into the BT11")
+        elif event == "fading":
+            if last_message != "fading":
+                last_message = "fading"
+                log("the session's own audio stopped; "
+                    f"waiting {tracker.idle_grace}s before a new session may decide")
+        elif event == "continues" and player_key != last_players:
+            last_message = "session"
+            log(f"playback continues: players={players_text(players)}; "
+                f"keeping the mode for session rate={_rate_text(session_rate)}")
+        last_players = player_key
+
+        if session_rate is None:
+            candidate, candidate_since = None, 0.0
+            # Only complain while a session is actually running: when nothing
+            # plays at all the "idle" line above already says everything.
+            if tracker.active and last_message != "no-rate":
+                last_message = "no-rate"
+                log("the playback session has no known sample rate yet; no decision")
             _sleep_interval(args.interval)
             continue
 
-        mode, reason, label = decide(rate, current)
-        message_key = f"{label}:{mode}:{rate}:{current}"
+        mode, reason, label = decide(session_rate, current)
+        message_key = f"{label}:{mode}:{session_rate}:{current}"
         if message_key != last_message:
-            log(f"players={players} rate={rate} Hz current={_mode_text(current)} -> {reason}")
+            log(f"session rate={session_rate} Hz players={players_text(players)} "
+                f"current={_mode_text(current)} -> {reason}")
             last_message = message_key
 
         now = time.monotonic()
@@ -469,6 +620,8 @@ def command_run(args) -> int:
         if mode != candidate:
             candidate, candidate_since = mode, now
         if now - candidate_since < args.confirm:
+            # A very short session (a notification ding) must not rewrite the
+            # mode; the verdict has to hold for the confirmation time.
             _sleep_interval(args.interval)
             continue
         if now < next_allowed:
@@ -553,6 +706,36 @@ def command_self_test(_args) -> int:
     check("fractional 1/44100 parses", _parse_rate("1/44100"), 44100)
     check("fractional 2/88200 parses", _parse_rate("2/88200"), 44100)
 
+    # A notification at another rate must not change the session's rate.
+    music = frozenset({("mpv", "mpv")})
+    ding = frozenset({("pw-play", "pw-play")})
+    tracker = SessionTracker(1.5)
+    check("session starts at 44.1 kHz", tracker.update(music, 44100, 0.0), "started")
+    check("session rate frozen at 44.1 kHz", tracker.target_rate, 44100)
+    check("48 kHz insert keeps the session",
+          tracker.update(music | ding, 48000, 0.4), "continues")
+    check("48 kHz insert keeps 44.1 kHz", tracker.target_rate, 44100)
+    check("ding leaving keeps the session",
+          tracker.update(music, 44100, 0.8), "continues")
+    check("session survives a short gap",
+          tracker.update(frozenset(), None, 1.2), "fading")
+    check("music returning resumes the session",
+          tracker.update(music, 44100, 2.0), "continues")
+    check("session ends after the grace",
+          tracker.update(frozenset(), None, 6.0), "fading")
+    check("late poll past the grace ends it",
+          tracker.update(frozenset(), None, 9.0), "ended")
+    check("silence without a session is idle",
+          tracker.update(frozenset(), None, 10.0), "idle")
+    check("playback after silence starts a new session",
+          tracker.update(ding, 48000, 11.0), "started")
+    check("new session uses the new rate", tracker.target_rate, 48000)
+    check("handover waits for the grace",
+          tracker.update(music, 44100, 20.0), "fading")
+    check("handover restarts the session after the grace",
+          tracker.update(music, 44100, 22.0), "replaced")
+    check("handover adopts the new rate", tracker.target_rate, 44100)
+
     print(f"self-test: {'PASS' if not failures else f'{failures} failure(s)'}")
     return 1 if failures else 0
 
@@ -576,6 +759,14 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="seconds a new sample-rate verdict must persist (default 1)",
+    )
+    parser.add_argument(
+        "--idle-grace",
+        type=float,
+        default=DEFAULT_IDLE_GRACE,
+        help="seconds a playback session's own streams may be absent before a "
+             "new playback session decides the mode again (default "
+             f"{DEFAULT_IDLE_GRACE})",
     )
     parser.add_argument(
         "--dry-run",
